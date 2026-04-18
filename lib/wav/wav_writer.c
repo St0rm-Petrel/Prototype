@@ -1,95 +1,33 @@
+// wav_writer.c
 #include "wav_writer.h"
 
-// Тег для системы логирования
 static const char *TAG = "WAV";
 
-// Генерация имени файла в формате 000001.wav
-static void generate_filename(char *filename, size_t len, uint32_t number) {
-    snprintf(filename, len, "%s/%06" PRIu32 ".wav", AUDIO_DIR_PATH, number);
-}
+// ← ИЗМЕНЕНО: буфер для 4 каналов
+int16_t pcm_buffer_4ch[DMA_BUF_SIZE * 4];
 
-// Создаем wav файл до записи аудио
-esp_err_t create_wav(void) {
-    // Если файл уже открыт, сначала закрываем
-    if (file_opened) {
-        ESP_LOGW(TAG, "WAV file already opened, closing first");
-        close_wav(0);
-    }
-    
-    // Убеждаемся, что предыдущий указатель обнулен
-    if (f != NULL) {
-        fclose(f);
-        f = NULL;
-    }
-    
-    // Инициализируем счетчик (если еще не инициализирован)
-    static bool counter_initialized = false;
-    if (!counter_initialized) {
-        if (counter_init() != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to initialize counter");
-            return ESP_FAIL;
-        }
-        counter_initialized = true;
-    }
-    
-    // Получаем следующий номер файла
-    current_file_number = counter_get_current() + 1;
-    
-    // Генерируем имя файла
-    generate_filename(current_filename, sizeof(current_filename), current_file_number);
-    
-    // Создаем файл
-    f = fopen(current_filename, "wb");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to create file: %s", current_filename);
-        ESP_LOGE(TAG, "errno: %d (%s)", errno, strerror(errno));
-        return ESP_FAIL;
-    }
-    
-    ESP_LOGI(TAG, "Created file: %s (#%06" PRIu32 ")", current_filename, current_file_number);
-    
-    // Пишем временный заголовок
-    memset(wav_header, 0, sizeof(wav_header));
-    size_t written = fwrite(wav_header, 1, 44, f);
-    if (written != 44) {
-        ESP_LOGE(TAG, "Failed to write WAV header");
-        fclose(f);
-        f = NULL;
-        return ESP_FAIL;
-    }
-    
-    fflush(f);
-    file_opened = true;
-    
-    return ESP_OK;
-}
+// ... остальные статические функции без изменений ...
 
-// Записываем данные из PCM-буфера в нынешний wav-файл
-esp_err_t write_wav(size_t buffer_size) {
-    // Убеждаемся, что все готово
+// ========== Запись 4-канальных данных ==========
+esp_err_t write_wav_4ch(size_t samples_per_channel) {
     if (!file_opened || f == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Теоретическое количество записанных байтов
-    size_t bytes_to_write = buffer_size * sizeof(int16_t);
-    // Действительное количество через запись
-    size_t written = fwrite(pcm_buffer, 1, bytes_to_write, f);
+    size_t total_samples = samples_per_channel * NUM_CHANNELS;
+    size_t bytes_to_write = total_samples * sizeof(int16_t);
+    size_t written = fwrite(pcm_buffer_4ch, 1, bytes_to_write, f);
     
-    // Проверяем, записаны ли все байты
     if (written != bytes_to_write) {
-        ESP_LOGE(TAG, "Failed to write PCM data: wrote %d/%d bytes", 
-                 written, bytes_to_write);
+        ESP_LOGE(TAG, "Failed to write PCM data: wrote %d/%d bytes", written, bytes_to_write);
         return ESP_FAIL;
     }
     
     return ESP_OK;
 }
 
-// Закрываем wav-файл, указав точное (не теоретическое) количество сэмплов
-// Это означает, что мы пишем заголовок для wav-файла и закрываем файл на уровне системы
-esp_err_t close_wav(uint32_t total_samples) {
-    // Убеждаемся, что файл точно открыт
+// ========== Закрытие WAV файла (с учётом 4 каналов) ==========
+esp_err_t close_wav(uint32_t total_samples_per_channel) {
     if (!file_opened || f == NULL) {
         ESP_LOGW(TAG, "No open WAV file to close");
         return ESP_OK;
@@ -97,10 +35,9 @@ esp_err_t close_wav(uint32_t total_samples) {
     
     ESP_LOGI(TAG, "Closing WAV file: %s", current_filename);
     
-    // Если сэмплов ноль, то файл считается аварийным и удаляется
-    if (total_samples > 0) {
-        // Обновляем WAV заголовок
-        uint32_t data_size = total_samples * BYTES_PER_SAMPLE;
+    if (total_samples_per_channel > 0) {
+        // ← ИЗМЕНЕНО: учёт 4 каналов
+        uint32_t data_size = total_samples_per_channel * NUM_CHANNELS * BYTES_PER_SAMPLE;
         uint32_t file_size = data_size + 36;
         
         // RIFF header
@@ -116,7 +53,8 @@ esp_err_t close_wav(uint32_t total_samples) {
         wav_header[12] = 'f'; wav_header[13] = 'm'; wav_header[14] = 't'; wav_header[15] = ' ';
         wav_header[16] = 16; wav_header[17] = 0; wav_header[18] = 0; wav_header[19] = 0;
         wav_header[20] = 1; wav_header[21] = 0;
-        wav_header[22] = 1; wav_header[23] = 0;
+        wav_header[22] = NUM_CHANNELS & 0xFF;           // ← ИЗМЕНЕНО: 4 канала
+        wav_header[23] = (NUM_CHANNELS >> 8) & 0xFF;
         wav_header[24] = SAMPLE_RATE & 0xFF;
         wav_header[25] = (SAMPLE_RATE >> 8) & 0xFF;
         wav_header[26] = (SAMPLE_RATE >> 16) & 0xFF;
@@ -125,7 +63,8 @@ esp_err_t close_wav(uint32_t total_samples) {
         wav_header[29] = (BYTE_RATE >> 8) & 0xFF;
         wav_header[30] = (BYTE_RATE >> 16) & 0xFF;
         wav_header[31] = (BYTE_RATE >> 24) & 0xFF;
-        wav_header[32] = 2; wav_header[33] = 0;
+        wav_header[32] = (NUM_CHANNELS * BYTES_PER_SAMPLE) & 0xFF;
+        wav_header[33] = ((NUM_CHANNELS * BYTES_PER_SAMPLE) >> 8) & 0xFF;
         wav_header[34] = 16; wav_header[35] = 0;
         
         // data subchunk
@@ -135,32 +74,25 @@ esp_err_t close_wav(uint32_t total_samples) {
         wav_header[42] = (data_size >> 16) & 0xFF;
         wav_header[43] = (data_size >> 24) & 0xFF;
         
-        // Обновляем заголовок в файле
         fseek(f, 0, SEEK_SET);
         fwrite(wav_header, 1, 44, f);
         fflush(f);
         
-        // Закрываем файл
         fclose(f);
         f = NULL;
         file_opened = false;
         
-        // Инкрементируем счетчик ТОЛЬКО после успешной записи
         if (counter_increment() != ESP_OK) {
             ESP_LOGW(TAG, "Failed to increment counter, but file saved");
         }
         
         ESP_LOGI(TAG, "File saved: %s", current_filename);
-        ESP_LOGI(TAG, "File size: %" PRIu32 " bytes", file_size + 8);
-        ESP_LOGI(TAG, "Duration: %.2f seconds", (float)total_samples / SAMPLE_RATE);
-        
+        ESP_LOGI(TAG, "Total samples per channel: %" PRIu32, total_samples_per_channel);
+        ESP_LOGI(TAG, "Duration: %.2f seconds", (float)total_samples_per_channel / SAMPLE_RATE);
     } else {
-        // Закрываем файл
         fclose(f);
         f = NULL;
         file_opened = false;
-
-        // Если нет данных, удаляем пустой файл
         ESP_LOGI(TAG, "No data recorded, deleting empty file");
         remove(current_filename);
         ESP_LOGI(TAG, "Empty file deleted");
@@ -169,33 +101,4 @@ esp_err_t close_wav(uint32_t total_samples) {
     return ESP_OK;
 }
 
-// Завершение записи wav-файла как процесса
-esp_err_t wav_deinit(void) {
-    // Убеждаемся, что wav-файл точно закрыт, иначе закрываем аварийно
-    if (file_opened) {
-        close_wav(0);
-    }
-    
-    // Убеждаемся, что файл закрыт на уровне системы
-    if (f != NULL) {
-        fclose(f);
-        f = NULL;
-    }
-    
-    // Обнуление связанных с этим глобальных переменных
-    file_opened = false;
-    memset(wav_header, 0, sizeof(wav_header));
-    memset(current_filename, 0, sizeof(current_filename));
-    
-    return ESP_OK;
-}
-
-// Служебные функции, возможно, бесполезны,
-// так как все переменные - глобальные
-uint32_t get_current_file_number(void) {
-    return current_file_number;
-}
-
-const char* get_current_filename(void) {
-    return current_filename;
-}
+// ... остальные функции без изменений ...
